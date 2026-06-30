@@ -65,6 +65,13 @@ REGION=""                   # AWS リージョン（grc URL 生成 / aws CLI に
 FULL_CLONE="false"          # true なら全履歴 clone（既定: shallow --depth 1）
 MAX_GEN="3"                 # ★保持世代数の上限（既定 3）
 DRY_RUN="false"             # true なら clone/削除を行わず、実行内容を表示
+
+# --- 認証 / 権限（スイッチロール）関連 ---
+# true なら CodeCommit 権限が無いとき、警告終了せず自動でスイッチロールする
+AUTO_SWITCH_ROLE="false"
+# 別チーム提供の「スイッチロール用シェル」のパス（source で呼び出す）。環境変数でも指定可
+SWITCH_ROLE_SCRIPT="${SWITCH_ROLE_SCRIPT:-}"
+
 DEBUG="${DEBUG:-false}"
 export DEBUG
 
@@ -100,8 +107,21 @@ usage() {
   --keep       <n>        保持する世代数 (1 以上の整数, 既定: 3)
   --full-clone            全履歴を clone (既定: --depth 1 の shallow clone)
   --dry-run               clone/削除は行わず、実行内容（clone と世代削除）を表示
+  --auto-switch-role      CodeCommit 権限が無い場合、警告終了せず自動でスイッチロールする
+                          （既定: 警告メッセージを出して終了）
+  --switch-role-script <path>
+                          自動スイッチロール時に source する専用シェルのパス
+                          （別チーム提供。環境変数 SWITCH_ROLE_SCRIPT でも指定可）
   --debug                 デバッグログを出力する
   -h, --help              このヘルプを表示
+
+認証 / 権限について:
+  - 実行開始時に AWS 認証済みか（aws sts get-caller-identity）を確認します。未認証の
+    場合は「aws login --remote で認証してください」と警告して終了します。
+  - 現在の IAM 権限で CodeCommit を操作できない場合:
+      * 既定                : スイッチロールするよう警告して終了します。
+      * --auto-switch-role  : --switch-role-script で指定した専用シェルを source して
+                              自動的にスイッチロールし、再判定して続行します。
 
 例:
   # ドライラン（clone と世代削除の内容を表示）
@@ -132,6 +152,8 @@ parse_args() {
       --keep)       MAX_GEN="${2:-}"; shift 2 ;;
       --full-clone) FULL_CLONE="true"; shift 1 ;;
       --dry-run)    DRY_RUN="true"; shift 1 ;;
+      --auto-switch-role)  AUTO_SWITCH_ROLE="true"; shift 1 ;;
+      --switch-role-script) SWITCH_ROLE_SCRIPT="${2:-}"; shift 2 ;;
       --debug)      DEBUG="true"; export DEBUG; shift 1 ;;
       -h|--help)    usage; exit 0 ;;
       *)            usage; die "不明なオプションです: ${1}" ;;
@@ -179,6 +201,20 @@ validate_inputs() {
 }
 
 # ---------------------------------------------------------------------------
+# 4b. CodeCommit 操作権限の判定（ensure_permission_or_switch から呼ばれる）
+#     軽量な読み取り API で権限を確認する（0=権限あり）。
+#       - リポジトリ名が分かる場合: get-repository（対象リポジトリに絞って確認）
+#       - 分からない場合         : list-repositories
+# ---------------------------------------------------------------------------
+probe_codecommit_permission() {
+  if [[ -n "${REPO_NAME}" ]]; then
+    aws codecommit get-repository --repository-name "${REPO_NAME}" >/dev/null 2>&1
+  else
+    aws codecommit list-repositories >/dev/null 2>&1
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # 5. 前提確認 / URL 確定
 # ---------------------------------------------------------------------------
 preflight() {
@@ -189,6 +225,14 @@ preflight() {
     export AWS_REGION="${REGION}"
     log_debug "AWS リージョンを設定: ${REGION}"
   fi
+
+  # 認証チェック（未認証なら aws login --remote を促して終了）
+  require_aws_authenticated
+
+  # CodeCommit 操作権限の確認（無ければスイッチロール: 自動 or 警告終了）
+  ensure_permission_or_switch \
+    "CodeCommit" probe_codecommit_permission \
+    "${AUTO_SWITCH_ROLE}" "${SWITCH_ROLE_SCRIPT}" "スイッチロール"
 
   if [[ -z "${REPO_URL}" ]]; then
     REPO_URL="codecommit::${REGION}://${REPO_NAME}"
@@ -323,6 +367,9 @@ main() {
   log_info "  clone 先      : ${CLONE_DIR}"
   log_info "  clone 方式    : $([[ "${FULL_CLONE}" == "true" ]] && echo '全履歴' || echo 'shallow(--depth 1)')"
   log_info "  保持世代上限  : ${MAX_GEN}"
+  log_info "  自動スイッチロール: ${AUTO_SWITCH_ROLE}"
+  [[ "${AUTO_SWITCH_ROLE}" == "true" ]] && \
+    log_info "  切替用シェル  : ${SWITCH_ROLE_SCRIPT:-(未指定)}"
   log_info "  DRY-RUN       : ${DRY_RUN}"
 
   clone_tag

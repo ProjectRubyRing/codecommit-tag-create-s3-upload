@@ -99,3 +99,104 @@ require_command() {
   local cmd="$1"
   command -v "$cmd" >/dev/null 2>&1 || die "コマンドが見つかりません: $cmd"
 }
+
+# ---------------------------------------------------------------------------
+# デバッグログ
+#   DEBUG=true のときだけ標準エラーへ出力する。
+#   （各スクリプトが独自に再定義しても動作は同じ。共通関数からの利用のため定義）
+# ---------------------------------------------------------------------------
+log_debug() {
+  [[ "${DEBUG:-false}" == "true" ]] || return 0
+  printf '%s[DEBUG]%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*" >&2
+}
+
+# ---------------------------------------------------------------------------
+# AWS 認証チェック
+#   事前に `aws login --remote` 等で認証済みか（= 有効な資格情報があるか）を
+#   確認する。未認証なら警告メッセージを出して終了する。
+#
+# usage: require_aws_authenticated
+# ---------------------------------------------------------------------------
+require_aws_authenticated() {
+  require_command aws
+
+  local ident
+  if ident="$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)"; then
+    log_debug "AWS 認証済み: ${ident}"
+    return 0
+  fi
+
+  log_error "AWS が未認証です（有効な資格情報が見つかりません）。"
+  log_error "  スクリプト実行前に、次のコマンドで認証してください:"
+  log_error "      aws login --remote"
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# 権限確認 + スイッチ（ロール/バック）共通処理
+#
+#   指定した「権限判定関数」を実行し、権限があれば何もしない。
+#   権限が無い場合の挙動は auto フラグで切り替える:
+#     - auto=false（既定） : 切替え方法を警告して終了する
+#     - auto=true          : 専用シェルを source して切替え、再判定する
+#                            （別チーム提供のスイッチ用シェルを source で呼び出す）
+#
+#   ※ source はカレントシェルで実行されるため、切替で設定される環境変数
+#     （AWS_PROFILE / AWS_*_TOKEN 等）はそのまま後続処理に引き継がれる。
+#
+# usage:
+#   ensure_permission_or_switch <ラベル> <判定関数名> <auto> <script_path> <切替名>
+#     <ラベル>     : 表示用の操作名（例: CodeCommit / S3）
+#     <判定関数名> : 権限の有無を返す関数名（0=権限あり, 非0=権限なし）
+#     <auto>       : true なら自動切替、false なら警告して終了
+#     <script_path>: source する専用シェルのパス（自動切替時は必須）
+#     <切替名>     : 表示用の切替操作名（例: スイッチロール / スイッチバック）
+# ---------------------------------------------------------------------------
+ensure_permission_or_switch() {
+  local label="$1"
+  local probe_fn="$2"
+  local auto="$3"
+  local script_path="$4"
+  local switch_name="$5"
+
+  if "${probe_fn}"; then
+    log_debug "${label} への操作権限を確認しました。"
+    return 0
+  fi
+
+  log_warn "現在の IAM 権限では ${label} への操作が許可されていません。"
+
+  # --- 自動切替を行わない場合: 警告して終了 ---
+  if [[ "${auto}" != "true" ]]; then
+    log_error "${label} を操作するには${switch_name}してから再実行してください。"
+    if [[ -n "${script_path}" ]]; then
+      log_error "  例:  source \"${script_path}\""
+    else
+      log_error "  （別チーム提供の${switch_name}用シェルを source してください）"
+    fi
+    exit 1
+  fi
+
+  # --- 自動切替を行う場合: 専用シェルを source ---
+  [[ -n "${script_path}" ]] || \
+    die "${switch_name}を自動実行するには切替用シェルのパス指定が必要です。"
+  [[ -f "${script_path}" ]] || \
+    die "${switch_name}用シェルが見つかりません: ${script_path}"
+
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    log_info "[DRY-RUN] ${switch_name}を実行します: source \"${script_path}\""
+    return 0
+  fi
+
+  log_info "${switch_name}を自動実行します: source \"${script_path}\""
+  # shellcheck source=/dev/null
+  source "${script_path}" || \
+    die "${switch_name}用シェルの実行に失敗しました: ${script_path}"
+
+  # 切替後に再判定
+  if "${probe_fn}"; then
+    log_success "${switch_name}後、${label} への操作権限を確認しました。"
+    return 0
+  fi
+  die "${switch_name}を実行しましたが、${label} への操作権限を獲得できませんでした。"
+}

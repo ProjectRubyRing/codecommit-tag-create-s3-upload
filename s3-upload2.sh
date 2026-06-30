@@ -78,6 +78,13 @@ DELETE_EXTRA="false"        # true なら aws s3 sync --delete
 DRY_RUN="false"             # true なら aws s3 sync --dryrun（実書き込みなし）
 ASSUME_YES="false"          # true なら対話確認をスキップ
 SUBDIR_PER_SRC="false"      # true なら各 src を basename のサブフォルダ配下へ
+
+# --- 認証 / 権限（スイッチバック）関連 ---
+# true なら S3 権限が無いとき、警告終了せず自動でスイッチバックする
+AUTO_SWITCH_BACK="false"
+# 別チーム提供の「スイッチバック用シェル」のパス（source で呼び出す）。環境変数でも指定可
+SWITCH_BACK_SCRIPT="${SWITCH_BACK_SCRIPT:-}"
+
 DEBUG="${DEBUG:-false}"
 export DEBUG
 
@@ -123,8 +130,21 @@ usage() {
   --delete                各転送先にあってローカルに無いオブジェクトを削除 (aws s3 sync --delete)
   --dry-run               S3 へは書き込まず、アップロード予定を表示 (aws s3 sync --dryrun)
   -y, --yes               アップロード前の対話確認をスキップ
+  --auto-switch-back      S3 権限が無い場合、警告終了せず自動でスイッチバックする
+                          （既定: 警告メッセージを出して終了）
+  --switch-back-script <path>
+                          自動スイッチバック時に source する専用シェルのパス
+                          （別チーム提供。環境変数 SWITCH_BACK_SCRIPT でも指定可）
   --debug                 デバッグログを出力する
   -h, --help              このヘルプを表示
+
+認証 / 権限について:
+  - 実行開始時に AWS 認証済みか（aws sts get-caller-identity）を確認します。未認証の
+    場合は「aws login --remote で認証してください」と警告して終了します。
+  - 現在の IAM 権限で S3 を操作できない場合（CodeCommit 用にスイッチロール中など）:
+      * 既定                : スイッチバックするよう警告して終了します。
+      * --auto-switch-back  : --switch-back-script で指定した専用シェルを source して
+                              自動的にスイッチバックし、再判定して続行します。
 
 注意:
   - --src の "=" 区切りはローカルパスに "=" を含めない前提です（最初の "=" で分割します）。
@@ -164,6 +184,8 @@ parse_args() {
       --delete)         DELETE_EXTRA="true"; shift 1 ;;
       --dry-run)        DRY_RUN="true"; shift 1 ;;
       -y|--yes)         ASSUME_YES="true"; shift 1 ;;
+      --auto-switch-back)   AUTO_SWITCH_BACK="true"; shift 1 ;;
+      --switch-back-script) SWITCH_BACK_SCRIPT="${2:-}"; shift 2 ;;
       --debug)          DEBUG="true"; export DEBUG; shift 1 ;;
       -h|--help)        usage; exit 0 ;;
       *)                usage; die "不明なオプションです: ${1}" ;;
@@ -268,6 +290,16 @@ check_dest_collisions() {
 }
 
 # ---------------------------------------------------------------------------
+# 7b. S3 操作権限の判定（ensure_permission_or_switch から呼ばれる）
+#     対象バケットへの head-bucket で確認する（0=操作可能）。
+#     ※ バケット不存在/リージョン相違でも失敗するため、失敗時はスイッチバック
+#       または警告終了の対象となる（切替後も失敗すれば明示的に終了する）。
+# ---------------------------------------------------------------------------
+probe_s3_permission() {
+  aws s3api head-bucket --bucket "${S3_BUCKET}" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
 # 8. 前提確認
 # ---------------------------------------------------------------------------
 preflight() {
@@ -279,12 +311,15 @@ preflight() {
     log_debug "AWS リージョンを設定: ${REGION}"
   fi
 
-  if ! aws s3api head-bucket --bucket "${S3_BUCKET}" >/dev/null 2>&1; then
-    log_warn "バケット '${S3_BUCKET}' に head-bucket できませんでした。"
-    log_warn "  バケット名/リージョン/IAM 権限(s3:ListBucket 等)を確認してください。続行はします。"
-  else
-    log_debug "バケット '${S3_BUCKET}' へのアクセス確認 OK。"
-  fi
+  # 認証チェック（未認証なら aws login --remote を促して終了）
+  require_aws_authenticated
+
+  # S3 操作権限の確認（無ければスイッチバック: 自動 or 警告終了）
+  ensure_permission_or_switch \
+    "S3" probe_s3_permission \
+    "${AUTO_SWITCH_BACK}" "${SWITCH_BACK_SCRIPT}" "スイッチバック"
+
+  log_debug "バケット '${S3_BUCKET}' へのアクセス確認 OK。"
 }
 
 # ---------------------------------------------------------------------------
@@ -338,6 +373,9 @@ print_plan() {
   log_info "  subdir-per-src: ${SUBDIR_PER_SRC}"
   log_info "  .git 除外     : ${EXCLUDE_GIT}"
   log_info "  --delete      : ${DELETE_EXTRA}"
+  log_info "  自動スイッチバック: ${AUTO_SWITCH_BACK}"
+  [[ "${AUTO_SWITCH_BACK}" == "true" ]] && \
+    log_info "  切替用シェル  : ${SWITCH_BACK_SCRIPT:-(未指定)}"
   log_info "  DRY-RUN       : ${DRY_RUN}"
   log_info "  src 件数      : ${#SRC_LOCALS[@]}"
   local i
