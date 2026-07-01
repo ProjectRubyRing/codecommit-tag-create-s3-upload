@@ -11,6 +11,11 @@
 #
 # 主な機能:
 #   - --src を複数回指定して、複数のローカルディレクトリを一度にアップロードできます。
+#   - --archive を付けると、各 src ディレクトリを zip アーカイブに固めてから
+#     アップロードします（--archive 無しは従来どおり aws s3 sync）。
+#       * 既定の zip 名は basename(<dir>).zip。--archive-name で上書き可（単一 src 時のみ）。
+#       * zip は一時ディレクトリに作成し、s3://.../<subpath>/<name>.zip へ aws s3 cp します。
+#       * 一時ファイルは終了時に自動削除します。
 #   - アップロード先は「バケット直下」「prefix(フォルダ)配下」「src ごとにサブフォルダを
 #     新規作成してその配下」のいずれにも対応します。
 #       * --s3-prefix <folder>     共通のベースフォルダ(prefix)配下へ
@@ -44,7 +49,7 @@
 #   - S3 へのアップロードには IAM 権限 s3:PutObject（--delete 時は s3:DeleteObject）、
 #     および s3:ListBucket が必要です。EC2 のインスタンスプロファイル等で付与してください。
 #
-# 依存: bash, aws (CLI v2)
+# 依存: bash, aws (CLI v2), zip（--archive 使用時のみ）
 # 共通部品: common.sh
 #
 set -Eeuo pipefail
@@ -78,6 +83,9 @@ DELETE_EXTRA="false"        # true なら aws s3 sync --delete
 DRY_RUN="false"             # true なら aws s3 sync --dryrun（実書き込みなし）
 ASSUME_YES="false"          # true なら対話確認をスキップ
 SUBDIR_PER_SRC="false"      # true なら各 src を basename のサブフォルダ配下へ
+ARCHIVE="false"             # true なら各 src を zip に固めてからアップロード
+ARCHIVE_NAME=""             # 生成する zip のファイル名（単一 src 時のみ上書き可）
+ARCHIVE_TMPDIR=""           # zip を一時作成するディレクトリ（実行時に mktemp で確保）
 
 # --- 認証 / 権限（スイッチバック）関連 ---
 # true なら S3 権限が無いとき、警告終了せず自動でスイッチバックする
@@ -97,6 +105,7 @@ EXCLUDES=()
 SRC_LOCALS=()               # ローカル絶対パス
 SRC_SUBPATHS=()             # prefix 配下の相対サブパス（正規化済み。空可）
 SRC_DESTS=()                # 表示・実行用の最終 S3 URL（s3://bucket/...）
+SRC_ZIPNAMES=()             # --archive 時に各 src を固める zip のファイル名
 
 # ---------------------------------------------------------------------------
 # 2. 使い方
@@ -124,11 +133,16 @@ usage() {
 オプション:
   --s3-prefix  <folder>   全 src 共通のベースフォルダ(prefix)。末尾 / 不要 (既定: バケット直下)
   --subdir-per-src        各 src を そのディレクトリ名(basename) のサブフォルダ配下へ配置
+  --archive               各 src を zip アーカイブに固めてからアップロードする
+                          （転送先は s3://.../<subpath>/<zip名>。既定 zip 名は basename(<dir>).zip）
+  --archive-name <name>   生成する zip のファイル名を指定（--archive と併用。単一 src 時のみ）
+                          拡張子 .zip が無ければ自動付与します
   --region     <region>   AWS リージョン (任意)
   --exclude-git           .git/* を除外する（git clone 結果をアップロードする場合に推奨）
-  --exclude    <pattern>  追加の除外パターン（aws s3 sync --exclude に渡す。複数回指定可）
+  --exclude    <pattern>  追加の除外パターン（sync は --exclude、archive は zip -x に渡す。複数指定可）
   --delete                各転送先にあってローカルに無いオブジェクトを削除 (aws s3 sync --delete)
-  --dry-run               S3 へは書き込まず、アップロード予定を表示 (aws s3 sync --dryrun)
+                          （--archive 時は単一オブジェクト転送のため無視されます）
+  --dry-run               S3 へは書き込まず、アップロード予定を表示 (aws s3 sync/cp --dryrun)
   -y, --yes               アップロード前の対話確認をスキップ
   --auto-switch-back      S3 権限が無い場合、警告終了せず自動でスイッチバックする
                           （既定: 警告メッセージを出して終了）
@@ -150,6 +164,9 @@ usage() {
   - --src の "=" 区切りはローカルパスに "=" を含めない前提です（最初の "=" で分割します）。
   - 複数の src が同一の転送先を指す構成で --delete を併用すると、後続の同期が先行分を
     削除してしまうため、その場合は実行を中止します（--subdir-per-src か =<subpath> で分離）。
+  - --archive 使用時は zip コマンドが必要です。zip は一時ディレクトリに作成し、終了時に
+    自動削除します。--delete は --archive 時には効果がありません（無視されます）。
+  - --archive で複数 src が同一の zip 転送先を指す場合は、後勝ちで上書きされるため中止します。
 
 例:
   # ドライラン（何がアップロードされるか確認。.git 除外。src ごとにサブフォルダ）
@@ -161,6 +178,19 @@ usage() {
   ./${SCRIPT_NAME} --src /opt/a=appA/v1 --src /opt/b=appB \\
     --s3-bucket my-artifacts --s3-prefix release \\
     --exclude-git --delete --yes
+
+  # zip アーカイブにしてからアップロード（各 src を basename.zip に固めて配置）
+  #   /opt/a -> s3://my-artifacts/release/a/a.zip
+  #   /opt/b -> s3://my-artifacts/release/b/b.zip
+  ./${SCRIPT_NAME} --src /opt/a --src /opt/b \\
+    --s3-bucket my-artifacts --s3-prefix release \\
+    --subdir-per-src --archive --exclude-git --yes
+
+  # 単一 src を任意の zip 名でアップロード
+  #   /opt/snap -> s3://my-artifacts/release/snapshot-2026-07-02.zip
+  ./${SCRIPT_NAME} --src /opt/snap \\
+    --s3-bucket my-artifacts --s3-prefix release \\
+    --archive --archive-name snapshot-2026-07-02.zip --exclude-git --yes
 
 終了コード:
   0  成功
@@ -178,6 +208,8 @@ parse_args() {
       --s3-bucket)      S3_BUCKET="${2:-}"; shift 2 ;;
       --s3-prefix)      S3_PREFIX="${2:-}"; shift 2 ;;
       --subdir-per-src) SUBDIR_PER_SRC="true"; shift 1 ;;
+      --archive)        ARCHIVE="true"; shift 1 ;;
+      --archive-name)   ARCHIVE_NAME="${2:-}"; shift 2 ;;
       --region)         REGION="${2:-}"; shift 2 ;;
       --exclude-git)    EXCLUDE_GIT="true"; shift 1 ;;
       --exclude)        EXCLUDES+=("${2:-}"); shift 2 ;;
@@ -209,6 +241,15 @@ normalize_subpath() {
 validate_inputs() {
   [[ "${#SRC_SPECS[@]}" -gt 0 ]] || { usage; die "--src は必須です（複数指定可）。"; }
   [[ -n "${S3_BUCKET}" ]]        || { usage; die "--s3-bucket は必須です。"; }
+
+  # --archive 関連の整合性チェック
+  if [[ -n "${ARCHIVE_NAME}" ]]; then
+    [[ "${ARCHIVE}" == "true" ]] || die "--archive-name は --archive と併用してください。"
+    [[ "${#SRC_SPECS[@]}" -eq 1 ]] || \
+      die "--archive-name は単一 --src のときのみ指定できます（複数指定時は既定の basename.zip）。"
+    # パス区切りを含む zip 名は転送先が意図とずれるため禁止
+    [[ "${ARCHIVE_NAME}" != */* ]] || die "--archive-name にパス区切り '/' は含められません: ${ARCHIVE_NAME}"
+  fi
 
   # 共通 prefix の正規化
   S3_PREFIX="$(normalize_subpath "${S3_PREFIX}")"
@@ -249,7 +290,28 @@ validate_inputs() {
   done
 
   build_dests
+  [[ "${ARCHIVE}" == "true" ]] && resolve_archive_names
   check_dest_collisions
+}
+
+# ---------------------------------------------------------------------------
+# 5b. --archive 時、各 src の zip ファイル名を決定する
+#     優先順位: --archive-name（単一 src 時） > basename(<dir>).zip
+# ---------------------------------------------------------------------------
+resolve_archive_names() {
+  SRC_ZIPNAMES=()
+  local i name
+  for i in "${!SRC_LOCALS[@]}"; do
+    if [[ -n "${ARCHIVE_NAME}" ]]; then
+      name="${ARCHIVE_NAME}"
+      # 拡張子 .zip が無ければ付与
+      [[ "${name}" == *.zip ]] || name="${name}.zip"
+    else
+      name="$(basename "${SRC_LOCALS[$i]}").zip"
+    fi
+    SRC_ZIPNAMES+=("${name}")
+    log_debug "src '${SRC_LOCALS[$i]}' の zip 名: '${name}'"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -273,6 +335,21 @@ build_dests() {
 #    --delete 併用時は相互破壊（後続 sync が先行分を削除）するため中止する。
 # ---------------------------------------------------------------------------
 check_dest_collisions() {
+  # --archive 時は最終転送先が s3://.../<subpath>/<zip名> という単一オブジェクトになる。
+  # 同一 zip オブジェクトを指す src があれば後勝ち上書きになるため中止する。
+  if [[ "${ARCHIVE}" == "true" ]]; then
+    local i j n="${#SRC_DESTS[@]}"
+    for (( i = 0; i < n; i++ )); do
+      for (( j = i + 1; j < n; j++ )); do
+        [[ "${SRC_DESTS[$i]}/${SRC_ZIPNAMES[$i]}" == "${SRC_DESTS[$j]}/${SRC_ZIPNAMES[$j]}" ]] || continue
+        die "複数の --src が同じ zip 転送先を指しています: ${SRC_DESTS[$i]}/${SRC_ZIPNAMES[$i]}
+  後勝ちで上書きされてしまうため中止します。
+  --subdir-per-src か --src <dir>=<subpath> で転送先を分けてください。"
+      done
+    done
+    return 0
+  fi
+
   local i j n="${#SRC_DESTS[@]}"
   for (( i = 0; i < n; i++ )); do
     for (( j = i + 1; j < n; j++ )); do
@@ -304,6 +381,7 @@ probe_s3_permission() {
 # ---------------------------------------------------------------------------
 preflight() {
   require_command aws
+  [[ "${ARCHIVE}" == "true" ]] && require_command zip
 
   if [[ -n "${REGION}" ]]; then
     export AWS_DEFAULT_REGION="${REGION}"
@@ -350,12 +428,101 @@ sync_one() {
 }
 
 # ---------------------------------------------------------------------------
+# 9b. 一時ディレクトリの確保と後始末（--archive 用）
+#     zip はここに作成し、スクリプト終了時（trap）に丸ごと削除する。
+# ---------------------------------------------------------------------------
+cleanup_tmpdir() {
+  [[ -n "${ARCHIVE_TMPDIR}" && -d "${ARCHIVE_TMPDIR}" ]] || return 0
+  rm -rf "${ARCHIVE_TMPDIR}"
+  log_debug "一時ディレクトリを削除しました: ${ARCHIVE_TMPDIR}"
+}
+
+setup_tmpdir() {
+  ARCHIVE_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/s3-upload-archive.XXXXXX")" \
+    || die "一時ディレクトリの作成に失敗しました。"
+  trap cleanup_tmpdir EXIT
+  log_debug "zip 用の一時ディレクトリ: ${ARCHIVE_TMPDIR}"
+}
+
+# ---------------------------------------------------------------------------
+# 9c. 1 ディレクトリ分の zip アーカイブ作成
+#     src_dir の内容を out_zip（絶対パス）へ再帰的に格納する。
+#     --exclude-git / --exclude は zip の -x（除外パターン）に渡す。
+# ---------------------------------------------------------------------------
+create_archive() {
+  local src_dir="${1}"
+  local out_zip="${2}"
+
+  # 除外パターンの組み立て（zip の -x は sync の --exclude と書式がやや異なる点に注意）
+  local excludes=()
+  [[ "${EXCLUDE_GIT}" == "true" ]] && excludes+=(".git/*")
+  local pat
+  for pat in "${EXCLUDES[@]:-}"; do
+    [[ -n "${pat}" ]] && excludes+=("${pat}")
+  done
+
+  log_info "zip を作成: ${src_dir}/ -> $(basename "${out_zip}")"
+
+  # 相対パスで格納するため src_dir へ cd してから zip する。out_zip は絶対パス。
+  # -r 再帰 / -q 静音（DEBUG 時のみ冗長表示）。
+  local zip_flags="-r"
+  [[ "${DEBUG}" == "true" ]] || zip_flags="${zip_flags}q"
+
+  local zip_cmd=(zip "${zip_flags}" "${out_zip}" .)
+  if [[ "${#excludes[@]}" -gt 0 ]]; then
+    zip_cmd+=(-x "${excludes[@]}")
+  fi
+
+  if ! ( cd "${src_dir}" && "${zip_cmd[@]}" ); then
+    die "zip アーカイブの作成に失敗しました（${src_dir} -> ${out_zip}）。"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 9d. 1 ディレクトリ分の zip 化 + S3 アップロード（aws s3 cp）
+#     dry-run 時は zip を作成したうえで aws s3 cp --dryrun で予定のみ表示。
+# ---------------------------------------------------------------------------
+archive_one() {
+  local src_dir="${1}"
+  local dest="${2}"
+  local zipname="${3}"
+
+  local out_zip="${ARCHIVE_TMPDIR}/${zipname}"
+  create_archive "${src_dir}" "${out_zip}"
+
+  local obj="${dest}/${zipname}"
+  local cp_args=(s3 cp "${out_zip}" "${obj}")
+  [[ "${DRY_RUN}" == "true" ]] && cp_args+=(--dryrun)
+
+  log_info "S3 へアップロード: ${zipname} -> ${obj}"
+
+  # aws CLI のネイティブ --dryrun を使うため run() は使わず直接実行する
+  if ! aws "${cp_args[@]}"; then
+    die "S3 へのアップロードに失敗しました（${obj}）。バケット/権限(s3:PutObject)を確認してください。"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # 10. 全 src を順にアップロード
 # ---------------------------------------------------------------------------
 upload_to_s3() {
   [[ "${EXCLUDE_GIT}" == "true" ]]  && log_info "  .git/* を除外します。"
-  [[ "${DELETE_EXTRA}" == "true" ]] && log_warn "  --delete 有効: 各転送先にあってローカルに無いオブジェクトは削除されます。"
   [[ "${DRY_RUN}" == "true" ]]      && log_info "  （--dryrun: 実際にはアップロードしません）"
+
+  # --- アーカイブモード: 各 src を zip 化して aws s3 cp ---
+  if [[ "${ARCHIVE}" == "true" ]]; then
+    [[ "${DELETE_EXTRA}" == "true" ]] && \
+      log_warn "  --archive 指定のため --delete は無視されます（単一オブジェクト転送）。"
+    setup_tmpdir
+    local i
+    for i in "${!SRC_LOCALS[@]}"; do
+      archive_one "${SRC_LOCALS[$i]}" "${SRC_DESTS[$i]}" "${SRC_ZIPNAMES[$i]}"
+    done
+    return 0
+  fi
+
+  # --- 通常モード: aws s3 sync ---
+  [[ "${DELETE_EXTRA}" == "true" ]] && log_warn "  --delete 有効: 各転送先にあってローカルに無いオブジェクトは削除されます。"
 
   local i
   for i in "${!SRC_LOCALS[@]}"; do
@@ -371,8 +538,9 @@ print_plan() {
   log_info "  バケット      : ${S3_BUCKET}"
   log_info "  ベースprefix  : ${S3_PREFIX:-(なし: バケット直下)}"
   log_info "  subdir-per-src: ${SUBDIR_PER_SRC}"
+  log_info "  アーカイブ    : ${ARCHIVE}$([[ "${ARCHIVE}" == "true" ]] && printf ' (zip)')"
   log_info "  .git 除外     : ${EXCLUDE_GIT}"
-  log_info "  --delete      : ${DELETE_EXTRA}"
+  log_info "  --delete      : ${DELETE_EXTRA}$([[ "${ARCHIVE}" == "true" && "${DELETE_EXTRA}" == "true" ]] && printf ' (archive時は無視)')"
   log_info "  自動スイッチバック: ${AUTO_SWITCH_BACK}"
   [[ "${AUTO_SWITCH_BACK}" == "true" ]] && \
     log_info "  切替用シェル  : ${SWITCH_BACK_SCRIPT:-(未指定)}"
@@ -380,7 +548,11 @@ print_plan() {
   log_info "  src 件数      : ${#SRC_LOCALS[@]}"
   local i
   for i in "${!SRC_LOCALS[@]}"; do
-    log_info "    [$((i + 1))] ${SRC_LOCALS[$i]}/  ->  ${SRC_DESTS[$i]}/"
+    if [[ "${ARCHIVE}" == "true" ]]; then
+      log_info "    [$((i + 1))] ${SRC_LOCALS[$i]}/  ->  ${SRC_DESTS[$i]}/${SRC_ZIPNAMES[$i]}"
+    else
+      log_info "    [$((i + 1))] ${SRC_LOCALS[$i]}/  ->  ${SRC_DESTS[$i]}/"
+    fi
   done
 }
 

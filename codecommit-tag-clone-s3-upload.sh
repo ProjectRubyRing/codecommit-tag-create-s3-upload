@@ -11,9 +11,16 @@
 #        既定では shallow clone（--depth 1）で対象タグのみ取得し高速・省容量
 #   2. clone 結果が確かに「そのタグの断面」になっているか検証
 #   3. .git を除いた作業ツリーを S3 (s3://<bucket>/<prefix>/) へ aws s3 sync で同期
-#   4. （--work-dir 未指定で作った一時ディレクトリは）終了時に自動削除
+#      （--archive 指定時は作業ツリーを zip に固めて s3://<bucket>/<prefix>/<zip名> へ aws s3 cp）
+#   4. （--work-dir 未指定で作った一時ディレクトリ / zip 用一時ファイルは）終了時に自動削除
 #
 #   => 対になる作成スクリプト: codecommit-tag-create.sh で固定した断面をそのまま配布できます。
+#
+# --archive について:
+#   - --archive を付けると、clone した作業ツリー(.git 除外)を zip アーカイブに固めてから
+#     アップロードします（--archive 無しは従来どおり aws s3 sync）。
+#   - 既定の zip 名は <リポジトリ名>-<タグ>.zip（タグ中の '/' は '-' に置換）。
+#     --archive-name で任意のファイル名に上書きできます（拡張子 .zip は自動付与）。
 #
 # 認証について:
 #   - CodeCommit へは HTTPS + AWS CLI 同梱の資格情報ヘルパ
@@ -24,7 +31,7 @@
 #   - grc 形式（codecommit::<region>://<repo>）の URL を渡した場合も、内部で HTTPS URL に
 #     変換してから clone します。
 #
-# 依存: bash, git, aws (CLI v2)
+# 依存: bash, git, aws (CLI v2), zip（--archive 使用時のみ）
 # 共通部品: common.sh
 #
 set -Eeuo pipefail
@@ -61,6 +68,9 @@ FULL_CLONE="false"          # true なら全履歴 clone（既定: shallow --dep
 DELETE_EXTRA="false"        # true なら aws s3 sync --delete（同期先の余剰を削除）
 DRY_RUN="false"             # true なら clone は行うが S3 は --dryrun（push しない）
 ASSUME_YES="false"          # true なら対話確認をスキップ
+ARCHIVE="false"             # true なら作業ツリーを zip に固めてからアップロード
+ARCHIVE_NAME=""             # 生成する zip のファイル名（既定: <リポジトリ名>-<タグ>.zip）
+ARCHIVE_TMPDIR=""           # zip を一時作成するディレクトリ（実行時に mktemp で確保）
 
 # --- 認証 / 権限（スイッチロール / スイッチバック）関連 ---
 # clone(CodeCommit) 用: true なら権限が無いとき警告終了せず自動でスイッチロールする
@@ -105,8 +115,13 @@ usage() {
   --region     <region>   AWS リージョン (--repo-name 使用時は必須)
   --work-dir   <path>     clone 先ディレクトリ。未指定なら一時領域に作成し終了時に削除
   --full-clone            全履歴を clone (既定: --depth 1 の shallow clone)
+  --archive               作業ツリー(.git 除外)を zip アーカイブに固めてからアップロードする
+                          （転送先は s3://<bucket>/<prefix>/<zip名>。既定 zip 名は <repo>-<tag>.zip）
+  --archive-name <name>   生成する zip のファイル名を指定（--archive と併用）
+                          拡張子 .zip が無ければ自動付与します
   --delete                S3 同期先にあってローカルに無いオブジェクトを削除 (aws s3 sync --delete)
-  --dry-run               clone はするが S3 へは書き込まず、アップロード予定を表示 (aws s3 sync --dryrun)
+                          （--archive 時は単一オブジェクト転送のため無視されます）
+  --dry-run               clone はするが S3 へは書き込まず、アップロード予定を表示 (aws s3 sync/cp --dryrun)
   -y, --yes               アップロード前の対話確認をスキップ
   --auto-switch-role      CodeCommit(clone) 権限が無い場合、警告終了せず自動でスイッチロールする
                           （既定: 警告メッセージを出して終了）
@@ -142,6 +157,16 @@ usage() {
     --tag release-2026-06-29 --s3-bucket my-artifacts \\
     --s3-prefix snapshots/my-repo/2026-06-29 --delete --yes
 
+  # タグ断面を zip アーカイブにしてアップロード
+  #   -> s3://my-artifacts/snapshots/my-repo/my-repo-release-2026-06-29.zip
+  ./${SCRIPT_NAME} --repo-name my-repo --region ap-northeast-1 \\
+    --tag release-2026-06-29 --s3-bucket my-artifacts \\
+    --s3-prefix snapshots/my-repo --archive --yes
+
+注意:
+  - --archive 使用時は zip コマンドが必要です。zip は一時ディレクトリに作成し、終了時に
+    自動削除します。--delete は --archive 時には効果がありません（無視されます）。
+
 終了コード:
   0  成功
   1  エラー
@@ -162,6 +187,8 @@ parse_args() {
       --region)     REGION="${2:-}"; shift 2 ;;
       --work-dir)   WORK_DIR="${2:-}"; shift 2 ;;
       --full-clone) FULL_CLONE="true"; shift 1 ;;
+      --archive)    ARCHIVE="true"; shift 1 ;;
+      --archive-name) ARCHIVE_NAME="${2:-}"; shift 2 ;;
       --delete)     DELETE_EXTRA="true"; shift 1 ;;
       --dry-run)    DRY_RUN="true"; shift 1 ;;
       -y|--yes)     ASSUME_YES="true"; shift 1 ;;
@@ -202,7 +229,31 @@ validate_inputs() {
   # prefix の前後 / を正規化（先頭/末尾の / を除去）
   S3_PREFIX="${S3_PREFIX#/}"
   S3_PREFIX="${S3_PREFIX%/}"
+
+  # --archive 関連の整合性チェックと zip 名の決定
+  if [[ -n "${ARCHIVE_NAME}" ]]; then
+    [[ "${ARCHIVE}" == "true" ]] || die "--archive-name は --archive と併用してください。"
+    [[ "${ARCHIVE_NAME}" != */* ]] || die "--archive-name にパス区切り '/' は含められません: ${ARCHIVE_NAME}"
+  fi
+  if [[ "${ARCHIVE}" == "true" ]]; then
+    if [[ -n "${ARCHIVE_NAME}" ]]; then
+      ZIPNAME="${ARCHIVE_NAME}"
+      [[ "${ZIPNAME}" == *.zip ]] || ZIPNAME="${ZIPNAME}.zip"
+    else
+      # 既定 zip 名: <リポジトリ名>-<タグ>.zip
+      #   リポジトリ名は --repo-name、無ければ URL 末尾から導出。
+      #   単一オブジェクト名にするため、タグ/リポジトリ中の '/' は '-' に置換する。
+      local repo_label="${REPO_NAME}"
+      [[ -n "${repo_label}" ]] || repo_label="${REPO_URL##*/}"
+      local tag_label="${TAG//\//-}"
+      repo_label="${repo_label//\//-}"
+      ZIPNAME="${repo_label}-${tag_label}.zip"
+    fi
+    log_debug "生成する zip 名: '${ZIPNAME}'"
+  fi
 }
+
+ZIPNAME=""      # --archive 時に生成する zip のファイル名（validate_inputs で確定）
 
 # ---------------------------------------------------------------------------
 # 4b. 操作権限の判定（ensure_permission_or_switch から呼ばれる）
@@ -238,6 +289,7 @@ ensure_s3_ready() {
 preflight() {
   require_command git
   require_command aws
+  [[ "${ARCHIVE}" == "true" ]] && require_command zip
 
   if [[ -n "${REGION}" ]]; then
     export AWS_DEFAULT_REGION="${REGION}"
@@ -292,11 +344,15 @@ prepare_work_dir() {
   log_info "clone 先: ${WORK_DIR}"
 }
 
-# 終了時に一時ディレクトリを削除
+# 終了時に一時ディレクトリを削除（work-dir と zip 用 tmpdir の両方）
 cleanup() {
   if [[ "${CLEANUP_WORK_DIR}" == "true" && -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
     log_debug "一時 work-dir を削除: ${WORK_DIR}"
     rm -rf "${WORK_DIR}" || log_warn "一時ディレクトリの削除に失敗: ${WORK_DIR}"
+  fi
+  if [[ -n "${ARCHIVE_TMPDIR}" && -d "${ARCHIVE_TMPDIR}" ]]; then
+    log_debug "zip 用一時ディレクトリを削除: ${ARCHIVE_TMPDIR}"
+    rm -rf "${ARCHIVE_TMPDIR}" || log_warn "一時ディレクトリの削除に失敗: ${ARCHIVE_TMPDIR}"
   fi
 }
 trap cleanup EXIT
@@ -344,13 +400,62 @@ verify_checkout() {
 }
 
 # ---------------------------------------------------------------------------
-# 9. S3 へアップロード（aws s3 sync）
-#    .git は除外。dry-run 時は aws s3 sync --dryrun で予定のみ表示。
+# 9a. 作業ツリーを zip アーカイブに固める（--archive 用）
+#     .git は常に除外する。zip は tmpdir に作成し、cleanup() で削除される。
+# ---------------------------------------------------------------------------
+create_archive() {
+  local src_dir="${1}"
+  local out_zip="${2}"
+
+  ARCHIVE_TMPDIR="$(dirname "${out_zip}")"    # cleanup() 対象として記録
+  log_info "zip を作成: ${src_dir}/ -> $(basename "${out_zip}")（.git は除外）"
+
+  # 相対パスで格納するため src_dir へ cd してから zip する。out_zip は絶対パス。
+  # -r 再帰 / -q 静音（DEBUG 時のみ冗長表示）。.git/* は常に除外。
+  local zip_flags="-r"
+  [[ "${DEBUG}" == "true" ]] || zip_flags="${zip_flags}q"
+
+  if ! ( cd "${src_dir}" && zip "${zip_flags}" "${out_zip}" . -x ".git/*" ); then
+    die "zip アーカイブの作成に失敗しました（${src_dir} -> ${out_zip}）。"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 9. S3 へアップロード
+#    通常   : aws s3 sync（.git は除外）
+#    archive: 作業ツリーを zip に固めて aws s3 cp で単一オブジェクトを転送
+#    dry-run 時は aws CLI のネイティブ --dryrun で予定のみ表示。
 # ---------------------------------------------------------------------------
 upload_to_s3() {
   local dest="s3://${S3_BUCKET}"
   [[ -n "${S3_PREFIX}" ]] && dest="${dest}/${S3_PREFIX}"
 
+  # --- アーカイブモード: zip 化して aws s3 cp ---
+  if [[ "${ARCHIVE}" == "true" ]]; then
+    [[ "${DELETE_EXTRA}" == "true" ]] && \
+      log_warn "  --archive 指定のため --delete は無視されます（単一オブジェクト転送）。"
+
+    local tmpdir
+    tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/cc-tag-archive.XXXXXX")" \
+      || die "一時ディレクトリの作成に失敗しました。"
+    local out_zip="${tmpdir}/${ZIPNAME}"
+    create_archive "${CLONE_DIR}" "${out_zip}"
+
+    local obj="${dest}/${ZIPNAME}"
+    local cp_args=(s3 cp "${out_zip}" "${obj}")
+    [[ "${DRY_RUN}" == "true" ]] && cp_args+=(--dryrun)
+
+    log_info "S3 へアップロードします: ${ZIPNAME} -> ${obj}"
+    [[ "${DRY_RUN}" == "true" ]] && log_info "  （--dryrun: 実際にはアップロードしません）"
+
+    # aws CLI のネイティブ --dryrun を使うため run() は使わず直接実行する
+    if ! aws "${cp_args[@]}"; then
+      die "S3 へのアップロードに失敗しました（${obj}）。バケット/権限(s3:PutObject)を確認してください。"
+    fi
+    return 0
+  fi
+
+  # --- 通常モード: aws s3 sync ---
   local sync_args=(s3 sync "${CLONE_DIR}/" "${dest}/" --exclude ".git/*")
   [[ "${DELETE_EXTRA}" == "true" ]] && sync_args+=(--delete)
   [[ "${DRY_RUN}" == "true" ]]      && sync_args+=(--dryrun)
@@ -381,12 +486,17 @@ main() {
   local dest="s3://${S3_BUCKET}"
   [[ -n "${S3_PREFIX}" ]] && dest="${dest}/${S3_PREFIX}"
 
+  # 表示用の最終転送先（archive 時は zip 名まで含める）
+  local shown_dest="${dest}/"
+  [[ "${ARCHIVE}" == "true" ]] && shown_dest="${dest}/${ZIPNAME}"
+
   log_info "=== 実行内容 ==="
   log_info "  リポジトリ  : ${REPO_URL}"
   log_info "  タグ        : ${TAG}"
-  log_info "  アップロード先: ${dest}/"
+  log_info "  アップロード先: ${shown_dest}"
   log_info "  clone 方式  : $([[ "${FULL_CLONE}" == "true" ]] && echo '全履歴' || echo 'shallow(--depth 1)')"
-  log_info "  --delete    : ${DELETE_EXTRA}"
+  log_info "  アーカイブ  : ${ARCHIVE}$([[ "${ARCHIVE}" == "true" ]] && printf ' (zip: %s)' "${ZIPNAME}")"
+  log_info "  --delete    : ${DELETE_EXTRA}$([[ "${ARCHIVE}" == "true" && "${DELETE_EXTRA}" == "true" ]] && printf ' (archive時は無視)')"
   log_info "  自動スイッチロール: ${AUTO_SWITCH_ROLE}"
   [[ "${AUTO_SWITCH_ROLE}" == "true" ]] && \
     log_info "  切替用シェル(role): ${SWITCH_ROLE_SCRIPT:-(未指定)}"
@@ -404,7 +514,7 @@ main() {
 
   if [[ "${DRY_RUN}" != "true" && "${ASSUME_YES}" != "true" ]]; then
     if [[ -t 0 ]]; then
-      if ! confirm "このタグの内容を ${dest}/ へアップロードしますか?"; then
+      if ! confirm "このタグの内容を ${shown_dest} へアップロードしますか?"; then
         die "ユーザーによって中止されました。"
       fi
     else
@@ -417,7 +527,7 @@ main() {
   if [[ "${DRY_RUN}" == "true" ]]; then
     log_info "DRY-RUN 完了: 上記の内容がアップロードされます。"
   else
-    log_success "完了: タグ '${TAG}' の断面を ${dest}/ へアップロードしました。"
+    log_success "完了: タグ '${TAG}' の断面を ${shown_dest} へアップロードしました。"
   fi
 }
 
