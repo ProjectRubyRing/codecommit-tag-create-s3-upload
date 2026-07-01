@@ -26,11 +26,13 @@
 #         --s3-bucket my-artifacts --s3-prefix snapshots/my-repo/2026-06-29 --exclude-git
 #
 # 認証について:
-#   - CodeCommit からの clone には Git 資格情報ヘルパ（git-remote-codecommit / HTTPS+IAM 等）、
-#     IAM 権限 codecommit:GitPull が必要です。
-#   - grc(git-remote-codecommit) 形式の URL の場合は aws CLI / git-remote-codecommit が必要です。
+#   - CodeCommit へは HTTPS + AWS CLI 同梱の資格情報ヘルパ
+#     （aws codecommit credential-helper）でアクセスします。git-remote-codecommit は不要です。
+#   - IAM 権限 codecommit:GitPull が必要です。
+#   - grc 形式（codecommit::<region>://<repo>）の URL を渡した場合も、内部で HTTPS URL に
+#     変換してから clone します。
 #
-# 依存: bash, git, GNU find（grc URL の場合は aws, git-remote-codecommit）
+# 依存: bash, git, GNU find, aws (CLI v2)
 # 共通部品: common.sh
 #
 set -Eeuo pipefail
@@ -235,16 +237,17 @@ preflight() {
     "${AUTO_SWITCH_ROLE}" "${SWITCH_ROLE_SCRIPT}" "スイッチロール"
 
   if [[ -z "${REPO_URL}" ]]; then
-    REPO_URL="codecommit::${REGION}://${REPO_NAME}"
-    log_debug "grc URL を生成: ${REPO_URL}"
+    REPO_URL="https://git-codecommit.${REGION}.amazonaws.com/v1/repos/${REPO_NAME}"
+    log_debug "CodeCommit HTTPS URL を生成: ${REPO_URL}"
+  else
+    # 利用者が grc 形式（codecommit::...）を渡した場合は HTTPS URL へ変換する
+    if ! REPO_URL="$(codecommit_to_https_url "${REPO_URL}" "${REGION}")"; then
+      die "grc 形式 URL の HTTPS 変換にリージョンが必要です。--region を指定してください: ${REPO_URL}"
+    fi
   fi
   log_info "clone URL: ${REPO_URL}"
-
-  if [[ "${REPO_URL}" == codecommit::* ]]; then
-    require_command aws
-    require_command git-remote-codecommit
-    log_debug "grc 形式の URL を検出しました（aws / git-remote-codecommit 確認済み）。"
-  fi
+  # HTTPS の認証は git の資格情報ヘルパ（aws codecommit credential-helper 等）が
+  # 環境側で設定済みであることを前提とする。
 }
 
 # ---------------------------------------------------------------------------

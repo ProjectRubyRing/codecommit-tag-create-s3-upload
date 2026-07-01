@@ -101,6 +101,49 @@ require_command() {
 }
 
 # ---------------------------------------------------------------------------
+# CodeCommit アクセス（git-remote-codecommit 不使用）
+#
+#   git-remote-codecommit（grc）は使わず、CodeCommit の HTTPS URL で clone/fetch/push
+#   する。HTTPS の認証は「git の資格情報ヘルパ（aws codecommit credential-helper 等）が
+#   環境側で設定済み」であることを前提とし、本スクリプトからは注入しない。
+#     例: git config --global credential.helper '!aws codecommit credential-helper $@'
+#         git config --global credential.UseHttpPath true
+# ---------------------------------------------------------------------------
+
+# grc 形式の URL を CodeCommit の HTTPS URL へ変換して標準出力へ echo する。
+#   codecommit::<region>://<repo> -> https://git-codecommit.<region>.amazonaws.com/v1/repos/<repo>
+#   codecommit://<repo>           -> <default_region> を使って上記と同様に変換
+#   https://...（既に HTTPS）      -> そのまま出力
+# grc 形式なのにリージョンが決定できない場合は非0で返す。
+# usage: url="$(codecommit_to_https_url "$in_url" "$default_region")" || die ...
+codecommit_to_https_url() {
+  local url="$1"
+  local default_region="${2:-}"
+  local region repo
+
+  case "${url}" in
+    codecommit::*://*)
+      region="${url#codecommit::}"; region="${region%%://*}"
+      repo="${url##*://}"
+      ;;
+    codecommit://*)
+      region="${default_region}"
+      repo="${url#codecommit://}"
+      ;;
+    *)
+      # grc 形式以外（https など）はそのまま返す
+      printf '%s' "${url}"
+      return 0
+      ;;
+  esac
+
+  if [[ -z "${region}" || -z "${repo}" ]]; then
+    return 1
+  fi
+  printf 'https://git-codecommit.%s.amazonaws.com/v1/repos/%s' "${region}" "${repo}"
+}
+
+# ---------------------------------------------------------------------------
 # デバッグログ
 #   DEBUG=true のときだけ標準エラーへ出力する。
 #   （各スクリプトが独自に再定義しても動作は同じ。共通関数からの利用のため定義）

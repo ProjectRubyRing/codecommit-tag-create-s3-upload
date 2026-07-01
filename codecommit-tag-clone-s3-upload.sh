@@ -16,13 +16,15 @@
 #   => 対になる作成スクリプト: codecommit-tag-create.sh で固定した断面をそのまま配布できます。
 #
 # 認証について:
-#   - CodeCommit からの clone には Git 資格情報ヘルパ（git-remote-codecommit / HTTPS+IAM 等）、
-#     IAM 権限 codecommit:GitPull が必要です。
+#   - CodeCommit へは HTTPS + AWS CLI 同梱の資格情報ヘルパ
+#     （aws codecommit credential-helper）でアクセスします。git-remote-codecommit は不要です。
+#   - clone には IAM 権限 codecommit:GitPull が必要です。
 #   - S3 へのアップロードには IAM 権限 s3:PutObject（--delete 時は s3:DeleteObject）、
 #     および s3:ListBucket が必要です。EC2 のインスタンスプロファイル等で付与してください。
-#   - grc(git-remote-codecommit) 形式の URL の場合は aws CLI / git-remote-codecommit が必要です。
+#   - grc 形式（codecommit::<region>://<repo>）の URL を渡した場合も、内部で HTTPS URL に
+#     変換してから clone します。
 #
-# 依存: bash, git, aws (CLI v2) （grc URL の場合は git-remote-codecommit）
+# 依存: bash, git, aws (CLI v2)
 # 共通部品: common.sh
 #
 set -Eeuo pipefail
@@ -179,18 +181,19 @@ preflight() {
     log_debug "AWS リージョンを設定: ${REGION}"
   fi
 
-  # --repo-name から grc URL を生成
+  # --repo-name から CodeCommit HTTPS URL を生成
   if [[ -z "${REPO_URL}" ]]; then
-    REPO_URL="codecommit::${REGION}://${REPO_NAME}"
-    log_debug "grc URL を生成: ${REPO_URL}"
+    REPO_URL="https://git-codecommit.${REGION}.amazonaws.com/v1/repos/${REPO_NAME}"
+    log_debug "CodeCommit HTTPS URL を生成: ${REPO_URL}"
+  else
+    # 利用者が grc 形式（codecommit::...）を渡した場合は HTTPS URL へ変換する
+    if ! REPO_URL="$(codecommit_to_https_url "${REPO_URL}" "${REGION}")"; then
+      die "grc 形式 URL の HTTPS 変換にリージョンが必要です。--region を指定してください: ${REPO_URL}"
+    fi
   fi
   log_info "clone URL: ${REPO_URL}"
-
-  # grc 形式なら依存コマンドを確認
-  if [[ "${REPO_URL}" == codecommit::* ]]; then
-    require_command git-remote-codecommit
-    log_debug "grc 形式の URL を検出しました（git-remote-codecommit 確認済み）。"
-  fi
+  # HTTPS の認証は git の資格情報ヘルパ（aws codecommit credential-helper 等）が
+  # 環境側で設定済みであることを前提とする。
 
   # S3 バケットへアクセスできるか軽く確認（権限/存在の早期検出）
   if ! aws s3api head-bucket --bucket "${S3_BUCKET}" >/dev/null 2>&1; then
@@ -250,7 +253,7 @@ clone_tag() {
   if ! git -c advice.detachedHead=false \
         clone "${depth_args[@]}" --branch "${TAG}" --single-branch \
         "${REPO_URL}" "${CLONE_DIR}"; then
-    die "clone に失敗しました。タグ名 '${TAG}' の存在、URL、認証（git-remote-codecommit / IAM codecommit:GitPull）を確認してください。"
+    die "clone に失敗しました。タグ名 '${TAG}' の存在、URL、認証（git 資格情報ヘルパ / IAM codecommit:GitPull）を確認してください。"
   fi
 }
 

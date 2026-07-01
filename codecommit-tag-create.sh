@@ -17,13 +17,14 @@
 #      （対になる取得スクリプト: codecommit-tag-clone-s3-upload.sh）
 #
 # 認証について:
-#   - 「すでに clone 済み」のリポジトリに対して fetch/push するため、origin の URL と
-#     Git 資格情報ヘルパ（git-remote-codecommit / HTTPS+IAM 等）が設定済みであることを前提とします。
-#   - grc(git-remote-codecommit) 形式の remote（codecommit::<region>://<repo>）の場合は
-#     aws CLI / git-remote-codecommit が必要です。
-#   - タグ push には IAM 権限 codecommit:GitPush が必要です。
+#   - 「すでに clone 済み」のリポジトリに対して fetch/push します。CodeCommit へは HTTPS +
+#     AWS CLI 同梱の資格情報ヘルパ（aws codecommit credential-helper）でアクセスします。
+#     git-remote-codecommit は不要です。
+#   - origin の URL が grc 形式（codecommit::<region>://<repo>）の場合は、本スクリプトが内部で
+#     HTTPS URL に読み替えて fetch/push します（リポジトリ設定は書き換えません）。
+#   - fetch には codecommit:GitPull、タグ push には codecommit:GitPush の IAM 権限が必要です。
 #
-# 依存: bash, git （grc remote の場合は aws, git-remote-codecommit）
+# 依存: bash, git, aws (CLI v2)
 # 共通部品: common.sh （log_info / log_success / log_warn / log_error / die / run /
 #           confirm / require_command）
 #
@@ -65,6 +66,9 @@ DRY_RUN="false"             # true の場合は push 等を行わず、何が起
 ASSUME_YES="false"          # true の場合は対話確認をスキップ
 DEBUG="${DEBUG:-false}"     # true の場合 log_debug を有効化
 export DEBUG
+
+# grc remote を HTTPS に読み替えるための git -c 引数（preflight で設定）。既定は空。
+CC_REMOTE_ARGS=()
 
 # ---------------------------------------------------------------------------
 # 2. 使い方
@@ -162,7 +166,8 @@ validate_inputs() {
 # 5. git ラッパ（常に対象ディレクトリで実行 / safe.directory を都度指定）
 # ---------------------------------------------------------------------------
 git_r() {
-  git -C "${REPO_DIR}" -c "safe.directory=${REPO_DIR}" "$@"
+  git -C "${REPO_DIR}" -c "safe.directory=${REPO_DIR}" \
+      "${CC_REMOTE_ARGS[@]}" "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -205,10 +210,21 @@ preflight() {
     log_debug "リポジトリ名の検証 OK: '${REPO_NAME}' は remote URL に含まれています。"
   fi
 
-  if [[ "${remote_url}" == codecommit::* ]]; then
-    require_command aws
-    require_command git-remote-codecommit
-    log_debug "grc 形式の remote を検出しました（aws / git-remote-codecommit 確認済み）。"
+  # origin が grc 形式なら HTTPS URL に読み替えて fetch/push する（grc URL は
+  # git-remote-codecommit が無いと扱えないため）。リポジトリ設定は書き換えず、
+  # この実行中だけ -c で URL を上書きする。
+  # HTTPS の認証は git の資格情報ヘルパ（aws codecommit credential-helper 等）が
+  # 環境側で設定済みであることを前提とする。
+  if [[ "${remote_url}" == codecommit://* || "${remote_url}" == codecommit::* ]]; then
+    local https_url
+    if ! https_url="$(codecommit_to_https_url "${remote_url}" "${REGION}")"; then
+      die "grc 形式の remote URL を HTTPS へ変換できません。--region を指定してください: ${remote_url}"
+    fi
+    CC_REMOTE_ARGS=(
+      -c "remote.${REMOTE}.url=${https_url}"
+      -c "remote.${REMOTE}.pushurl=${https_url}"
+    )
+    log_info "grc 形式の remote を HTTPS に読み替えて操作します: ${https_url}"
   fi
 }
 
@@ -218,7 +234,7 @@ preflight() {
 fetch_remote() {
   log_info "リモートから fetch します（${REMOTE}, --prune --tags）..."
   if ! git_r fetch --prune --tags "${REMOTE}"; then
-    die "fetch に失敗しました。ネットワーク / 認証（git-remote-codecommit, IAM 権限 codecommit:GitPull 等）を確認してください。"
+    die "fetch に失敗しました。ネットワーク / 認証（aws codecommit credential-helper, IAM 権限 codecommit:GitPull 等）を確認してください。"
   fi
 }
 

@@ -27,10 +27,18 @@ sudo dnf install -y git
 # AWS CLI v2（公式インストーラ）
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
 unzip awscliv2.zip && sudo ./aws/install
-# CodeCommit を grc 形式 URL で扱う場合（codecommit::<region>://<repo>）
-sudo dnf install -y python3-pip && pip3 install --user git-remote-codecommit
+
+# CodeCommit の HTTPS アクセス用資格情報ヘルパを設定（スクリプト実行前に一度だけ）
+git config --global credential.helper '!aws codecommit credential-helper $@'
+git config --global credential.UseHttpPath true
 ```
 
+- CodeCommit へは **HTTPS URL** でアクセスします。`git-remote-codecommit`（grc）のインストールは
+  **不要** です。（`codecommit::<region>://<repo>` 形式の URL を渡した場合も、内部で
+  `https://git-codecommit.<region>.amazonaws.com/v1/repos/<repo>` に変換して使用します）
+- **前提**: HTTPS の認証は上記の **git 資格情報ヘルパ（`aws codecommit credential-helper`）が
+  設定済み** であることを前提とします。スクリプトは認証設定を注入しません。未設定の場合は
+  上記コマンドを実行してください。
 - 認証は EC2 のインスタンスプロファイル（IAM ロール）を推奨。
 - 必要な IAM 権限:
   - タグ作成: `codecommit:GitPull`, `codecommit:GitPush`
