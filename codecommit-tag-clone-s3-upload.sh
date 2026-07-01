@@ -61,6 +61,17 @@ FULL_CLONE="false"          # true なら全履歴 clone（既定: shallow --dep
 DELETE_EXTRA="false"        # true なら aws s3 sync --delete（同期先の余剰を削除）
 DRY_RUN="false"             # true なら clone は行うが S3 は --dryrun（push しない）
 ASSUME_YES="false"          # true なら対話確認をスキップ
+
+# --- 認証 / 権限（スイッチロール / スイッチバック）関連 ---
+# clone(CodeCommit) 用: true なら権限が無いとき警告終了せず自動でスイッチロールする
+AUTO_SWITCH_ROLE="false"
+# 別チーム提供の「スイッチロール用シェル」のパス（source で呼び出す）。環境変数でも指定可
+SWITCH_ROLE_SCRIPT="${SWITCH_ROLE_SCRIPT:-}"
+# upload(S3) 用: true なら権限が無いとき警告終了せず自動でスイッチバックする
+AUTO_SWITCH_BACK="false"
+# 別チーム提供の「スイッチバック用シェル」のパス（source で呼び出す）。環境変数でも指定可
+SWITCH_BACK_SCRIPT="${SWITCH_BACK_SCRIPT:-}"
+
 DEBUG="${DEBUG:-false}"
 export DEBUG
 
@@ -97,8 +108,29 @@ usage() {
   --delete                S3 同期先にあってローカルに無いオブジェクトを削除 (aws s3 sync --delete)
   --dry-run               clone はするが S3 へは書き込まず、アップロード予定を表示 (aws s3 sync --dryrun)
   -y, --yes               アップロード前の対話確認をスキップ
+  --auto-switch-role      CodeCommit(clone) 権限が無い場合、警告終了せず自動でスイッチロールする
+                          （既定: 警告メッセージを出して終了）
+  --switch-role-script <path>
+                          自動スイッチロール時に source する専用シェルのパス
+                          （別チーム提供。環境変数 SWITCH_ROLE_SCRIPT でも指定可）
+  --auto-switch-back      S3(upload) 権限が無い場合、警告終了せず自動でスイッチバックする
+                          （既定: 警告メッセージを出して終了）
+  --switch-back-script <path>
+                          自動スイッチバック時に source する専用シェルのパス
+                          （別チーム提供。環境変数 SWITCH_BACK_SCRIPT でも指定可）
   --debug                 デバッグログを出力する
   -h, --help              このヘルプを表示
+
+認証 / 権限について:
+  - 実行開始時に AWS 認証済みか（aws sts get-caller-identity）を確認します。未認証の
+    場合は「aws login --remote で認証してください」と警告して終了します。
+  - clone 前に CodeCommit を操作できるか確認します。権限が無い場合:
+      * 既定                : スイッチロールするよう警告して終了します。
+      * --auto-switch-role  : --switch-role-script の専用シェルを source して自動切替します。
+  - upload 前に S3 を操作できるか確認します（スイッチロール中は S3 権限が無いことがあるため）。
+    権限が無い場合:
+      * 既定                : スイッチバックするよう警告して終了します。
+      * --auto-switch-back  : --switch-back-script の専用シェルを source して自動切替します。
 
 例:
   # ドライラン（何がアップロードされるか確認）
@@ -133,6 +165,10 @@ parse_args() {
       --delete)     DELETE_EXTRA="true"; shift 1 ;;
       --dry-run)    DRY_RUN="true"; shift 1 ;;
       -y|--yes)     ASSUME_YES="true"; shift 1 ;;
+      --auto-switch-role)   AUTO_SWITCH_ROLE="true"; shift 1 ;;
+      --switch-role-script) SWITCH_ROLE_SCRIPT="${2:-}"; shift 2 ;;
+      --auto-switch-back)   AUTO_SWITCH_BACK="true"; shift 1 ;;
+      --switch-back-script) SWITCH_BACK_SCRIPT="${2:-}"; shift 2 ;;
       --debug)      DEBUG="true"; export DEBUG; shift 1 ;;
       -h|--help)    usage; exit 0 ;;
       *)            usage; die "不明なオプションです: ${1}" ;;
@@ -169,6 +205,34 @@ validate_inputs() {
 }
 
 # ---------------------------------------------------------------------------
+# 4b. 操作権限の判定（ensure_permission_or_switch から呼ばれる）
+#     いずれも軽量な読み取り API で権限を確認する（0=権限あり）。
+#       - CodeCommit: リポジトリ名が分かれば get-repository、無ければ list-repositories
+#       - S3        : 対象バケットへの head-bucket
+# ---------------------------------------------------------------------------
+probe_codecommit_permission() {
+  if [[ -n "${REPO_NAME}" ]]; then
+    aws codecommit get-repository --repository-name "${REPO_NAME}" >/dev/null 2>&1
+  else
+    aws codecommit list-repositories >/dev/null 2>&1
+  fi
+}
+
+probe_s3_permission() {
+  aws s3api head-bucket --bucket "${S3_BUCKET}" >/dev/null 2>&1
+}
+
+# S3 操作権限の確認（無ければスイッチバック: 自動 or 警告終了）。
+# clone のあと、実アップロードの直前に呼び出す（スイッチロール中は S3 権限が
+# 無いことがあるため、clone 用の権限確認とは分けて実施する）。
+ensure_s3_ready() {
+  ensure_permission_or_switch \
+    "S3" probe_s3_permission \
+    "${AUTO_SWITCH_BACK}" "${SWITCH_BACK_SCRIPT}" "スイッチバック"
+  log_debug "バケット '${S3_BUCKET}' へのアクセス確認 OK。"
+}
+
+# ---------------------------------------------------------------------------
 # 5. 前提確認 / URL 確定
 # ---------------------------------------------------------------------------
 preflight() {
@@ -180,6 +244,14 @@ preflight() {
     export AWS_REGION="${REGION}"
     log_debug "AWS リージョンを設定: ${REGION}"
   fi
+
+  # 認証チェック（未認証なら aws login --remote を促して終了）
+  require_aws_authenticated
+
+  # clone(CodeCommit) 操作権限の確認（無ければスイッチロール: 自動 or 警告終了）
+  ensure_permission_or_switch \
+    "CodeCommit" probe_codecommit_permission \
+    "${AUTO_SWITCH_ROLE}" "${SWITCH_ROLE_SCRIPT}" "スイッチロール"
 
   # --repo-name から CodeCommit HTTPS URL を生成
   if [[ -z "${REPO_URL}" ]]; then
@@ -194,14 +266,8 @@ preflight() {
   log_info "clone URL: ${REPO_URL}"
   # HTTPS の認証は git の資格情報ヘルパ（aws codecommit credential-helper 等）が
   # 環境側で設定済みであることを前提とする。
-
-  # S3 バケットへアクセスできるか軽く確認（権限/存在の早期検出）
-  if ! aws s3api head-bucket --bucket "${S3_BUCKET}" >/dev/null 2>&1; then
-    log_warn "バケット '${S3_BUCKET}' に head-bucket できませんでした。"
-    log_warn "  バケット名/リージョン/IAM 権限(s3:ListBucket 等)を確認してください。続行はします。"
-  else
-    log_debug "バケット '${S3_BUCKET}' へのアクセス確認 OK。"
-  fi
+  # ※ S3 の操作権限は、スイッチロール後に権限が変わり得るため、clone 後・
+  #   アップロード直前に ensure_s3_ready() で確認する。
 }
 
 # ---------------------------------------------------------------------------
@@ -321,11 +387,20 @@ main() {
   log_info "  アップロード先: ${dest}/"
   log_info "  clone 方式  : $([[ "${FULL_CLONE}" == "true" ]] && echo '全履歴' || echo 'shallow(--depth 1)')"
   log_info "  --delete    : ${DELETE_EXTRA}"
+  log_info "  自動スイッチロール: ${AUTO_SWITCH_ROLE}"
+  [[ "${AUTO_SWITCH_ROLE}" == "true" ]] && \
+    log_info "  切替用シェル(role): ${SWITCH_ROLE_SCRIPT:-(未指定)}"
+  log_info "  自動スイッチバック: ${AUTO_SWITCH_BACK}"
+  [[ "${AUTO_SWITCH_BACK}" == "true" ]] && \
+    log_info "  切替用シェル(back): ${SWITCH_BACK_SCRIPT:-(未指定)}"
   log_info "  DRY-RUN     : ${DRY_RUN}"
 
   # clone と検証は read-only。実アップロード前にのみ確認を取る。
   clone_tag
   verify_checkout
+
+  # アップロード直前に S3 操作権限を確認（無ければスイッチバック: 自動 or 警告終了）
+  ensure_s3_ready
 
   if [[ "${DRY_RUN}" != "true" && "${ASSUME_YES}" != "true" ]]; then
     if [[ -t 0 ]]; then
